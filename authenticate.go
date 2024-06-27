@@ -12,7 +12,7 @@ import (
 	"github.com/pkg/browser"
 )
 
-const scope = "Files.Read Files.Read.All offline_access"
+const scope = "Files.ReadWrite offline_access"
 
 func CreateAccess(clientID string, redirectURI string, fname string) (*GraphToken, error) {
 	gotToken := false
@@ -44,7 +44,7 @@ func CreateAccess(clientID string, redirectURI string, fname string) (*GraphToke
 	//Save token
 	if fname != "" {
 		b, _ := json.MarshalIndent(t, "", "\t")
-		os.WriteFile(fname, b, 0666)
+		os.WriteFile(fname, b, os.ModePerm)
 	}
 	return t, nil
 }
@@ -161,13 +161,4 @@ func (t *GraphToken) refresh() error {
 	//Handle access token
 	body, _ := io.ReadAll(resp.Body)
 	return json.Unmarshal(body, t)
-}
-
-func (t *GraphToken) MakeRequest(method string, url string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(method, "https://graph.microsoft.com/v1.0"+url, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Authorization", "Bearer "+t.AccessToken)
-	return http.DefaultClient.Do(req)
 }

@@ -90,9 +90,23 @@ func (err *ErrorResponse) Error() string {
 	)
 }
 
-type ChildrenResponse struct {
-	Context  string       `json:"@odata.context"`
-	Count    int          `json:"@odata.count"`
-	NextLink string       `json:"@odata.nextLink"`
-	Data     []*DriveItem `json:"value"`
+type ResponsePaginated[T any] struct {
+	Context  string `json:"@odata.context"`
+	Count    int    `json:"@odata.count"`
+	NextLink string `json:"@odata.nextLink"`
+	Value    T      `json:"value"`
+}
+
+type ConflictBehaviour string
+
+const (
+	ConflictBehaviour_Rename  = ConflictBehaviour("rename")
+	ConflictBehaviour_Fail    = ConflictBehaviour("fail")
+	ConflictBehaviour_Replace = ConflictBehaviour("replace")
+)
+
+type UploadSessionResponse struct {
+	UploadURL          string   `json:"uploadUrl"`
+	Expiration         string   `json:"expirationDateTime"`
+	NextExpectedRanges []string `json:"nextExpectedRanges"`
 }

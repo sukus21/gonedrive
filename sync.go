@@ -4,126 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
 )
 
 const hashfile = "!._hashes.json"
-
-// Helper function, creates URL from path and query.
-func generatePath(path string, query []string) string {
-	o := "root:/" + path + ":/children"
-	if path == "" {
-		o = "root/children"
-	}
-	for i, v := range query {
-		if i == 0 {
-			o += "?"
-		} else {
-			o += "&"
-		}
-		o += v
-	}
-	return o
-}
-
-// Get DriveItem information for a single file.
-// Path should be WITHOUT leading/trailing slashes.
-func (t *GraphToken) ListFile(path string) (*DriveItem, error) {
-	urlpath := generatePath(path, nil)
-	resp, err := t.MakeRequest("GET", "/me/drive/"+urlpath, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	//Read response body
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	//Invalid response?
-	if resp.StatusCode > 202 {
-		err = &ErrorResponse{}
-		json.Unmarshal(body, err)
-		return nil, err
-	}
-
-	//Decode body
-	dec := &DriveItem{}
-	err = json.Unmarshal(body, dec)
-	return dec, err
-}
-
-// Lists all files in a given folder.
-// Path should be WITHOUT leading/trailing slashes.
-func (t *GraphToken) ListFolder(path string) ([]*DriveItem, error) {
-	songlist := make([]*DriveItem, 0, 1024)
-	query := []string{}
-
-	for {
-		resp, err := t.getChildren(path, query)
-		if err != nil {
-			return nil, err
-		}
-		songlist = append(songlist, resp.Data...)
-		if resp.NextLink == "" {
-			return songlist, nil
-		}
-		split := strings.SplitN(resp.NextLink, "?", 2)
-		query = split[1:]
-	}
-}
-
-// Runs a query to get all DriveItems within a folder.
-func (t *GraphToken) getChildren(path string, query []string) (*ChildrenResponse, error) {
-
-	//Generate proper path
-	up := generatePath(path, query)
-
-	//Send request to OneDrive
-	resp, err := t.MakeRequest("GET", "/me/drive/"+up, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	//Read response body
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	//Invalid response?
-	if resp.StatusCode > 202 {
-		err = &ErrorResponse{}
-		json.Unmarshal(body, err)
-		return nil, err
-	}
-
-	//Decode body
-	dec := &ChildrenResponse{}
-	err = json.Unmarshal(body, dec)
-	return dec, err
-}
-
-// Downloads a DriveItem, and returns the file body.
-func (t *GraphToken) DownloadFile(file *DriveItem) ([]byte, error) {
-	resp, err := t.MakeRequest(
-		"GET",
-		fmt.Sprintf("/me/drive/items/%s/content", file.Id),
-		nil,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
-}
 
 // A read-only sync of a given OneDrive folder.
 // Downloads files that don't exist in local directory.
@@ -219,7 +105,7 @@ func (t *GraphToken) SyncFolder(odpath string, destpath string, filetype string)
 			for i := range jobs {
 
 				//Download file
-				b, err := t.DownloadFile(i)
+				b, err := t.DownloadDriveItem(i)
 				if err != nil {
 					results <- "error: " + err.Error()
 					countmu.Lock()
