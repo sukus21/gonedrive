@@ -41,11 +41,11 @@ func (t *GraphToken) ListFolder(path string) ([]*DriveItem, error) {
 }
 
 // Downloads a DriveItem, and returns the file body.
-func (t *GraphToken) DownloadDriveItem(item *DriveItem) ([]byte, error) {
-	resp, err := t.MakeRequest("GET", fmt.Sprintf("/me/drive/items/%s/content", item.Id), nil)
+// It is the responsibility of the caller to close the resulting reader.
+func (t *GraphToken) DownloadDriveItem(item *DriveItem) (io.ReadCloser, error) {
+	response, err := t.MakeRequest("GET", fmt.Sprintf("/me/drive/items/%s/content", item.Id), nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return response.Body, nil
 }

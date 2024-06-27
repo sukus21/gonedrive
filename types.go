@@ -17,7 +17,7 @@ type DriveItem struct {
 	Id           string `json:"id"`
 	Name         string `json:"name"`
 	Description  string `json:"description"`
-	Size         int    `json:"size"`
+	Size         int64  `json:"size"`
 	WebURL       string `json:"webUrl"`
 	Ctag         string `json:"cTag"`
 	Etag         string `json:"eTag"`
@@ -59,6 +59,10 @@ type DriveItem struct {
 			ViewType  string `json:"viewType"`
 		} `json:"view"`
 	} `json:"folder"`
+}
+
+func (item *DriveItem) IsDir() bool {
+	return item.Folder != nil
 }
 
 type Hashes struct {

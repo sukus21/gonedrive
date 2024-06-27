@@ -1,168 +1,241 @@
 package gonedrive
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"os"
-	"strings"
+	"path"
+	"path/filepath"
 	"sync"
+
+	"github.com/sukus21/gonedrive/quickxor"
 )
 
-const hashfile = "!._hashes.json"
+type SyncAction string
+
+type SyncMsg struct {
+	Action     SyncAction
+	Message    string
+	LocalPath  string
+	RemotePath string
+}
+
+type SyncFile struct {
+	// Full file path
+	FileName string
+
+	// File size, not relevant for directories
+	Size int64
+
+	// Is this a directory?
+	IsDir bool
+}
+
+type SyncFilter func(file SyncFile) bool
+type SyncEvent func(msg SyncMsg)
+
+func IgnoreFolders(file SyncFile) bool {
+	return file.IsDir
+}
+
+type syncContext struct {
+	t          *GraphToken
+	mux        sync.Mutex
+	wg         sync.WaitGroup
+	c          chan *DriveItem
+	localFiles map[string]SyncFile
+	filterFn   SyncFilter
+	eventFn    SyncEvent
+	remotePath string
+	localPath  string
+}
+
+func (ctx *syncContext) addItem(item *DriveItem) {
+	ctx.wg.Add(1)
+	ctx.c <- item
+}
+
+func (ctx *syncContext) syncQueue() {
+	for item := range ctx.c {
+		msg := ctx.HandleItem(item)
+		if ctx.eventFn != nil {
+			ctx.eventFn(msg)
+		}
+	}
+}
+
+func (ctx *syncContext) HandleItem(item *DriveItem) SyncMsg {
+	defer ctx.wg.Done()
+
+	// Find local file in map
+	ctx.mux.Lock()
+	localFile, exists := ctx.localFiles[item.Name]
+	delete(ctx.localFiles, item.Name)
+	ctx.mux.Unlock()
+
+	// I'll be using these
+	remotePath := path.Join(ctx.remotePath, item.Name)
+	localPath := filepath.Join(ctx.localPath, item.Name)
+	buildMsg := func(action SyncAction, message string) SyncMsg {
+		return SyncMsg{
+			Action:     action,
+			Message:    message,
+			RemotePath: remotePath,
+			LocalPath:  localPath,
+		}
+	}
+
+	// Cannot sync directories at the moment
+	if item.IsDir() {
+		return buildMsg("error", "remote file is directory")
+	}
+
+	// Handle existing local file
+	if exists {
+		// Cannot sync directories
+		if localFile.IsDir {
+			return buildMsg("error", "local file is directory")
+		}
+
+		// Is local file identical?
+		if ctx.syncFilesIdentical(localFile, item) {
+			return buildMsg("skip", "up to date")
+		}
+
+		// No they are not, remove local file
+		if err := os.Remove(localPath); err != nil {
+			return buildMsg("error", err.Error())
+		}
+	}
+
+	// Download new file from remote
+	remoteReader, err := ctx.t.DownloadDriveItem(item)
+	if err != nil {
+		return buildMsg("error", err.Error())
+	}
+
+	//Save file and all that
+	localWriter, err := os.Create(localPath)
+	if err != nil {
+		return buildMsg("error", err.Error())
+	}
+	defer localWriter.Close()
+	if _, err = io.Copy(localWriter, remoteReader); err != nil {
+		return buildMsg("error", err.Error())
+	}
+
+	// Success!
+	return buildMsg("downloaded", "downloaded")
+}
+
+func (ctx *syncContext) syncFilesIdentical(local SyncFile, remote *DriveItem) bool {
+	if local.Size != remote.Size {
+		return false
+	}
+
+	// Hash local file
+	hasher := quickxor.NewHasher()
+	f, err := os.Open(local.FileName)
+	if err != nil {
+		return false
+	}
+	io.Copy(hasher, f)
+
+	// Compare hashes
+	return hasher.GetHashBase64() == remote.File.Hashes.QuickXor
+}
 
 // A read-only sync of a given OneDrive folder.
 // Downloads files that don't exist in local directory.
 // Deletes files in local directory not found on OneDrive.
-// Does not redownload existing files.
-// Creates a json file in the target directory to store state of synced files.
-func (t *GraphToken) SyncFolder(odpath string, destpath string, filetype string) error {
-	skipCount := 0
-	downloadCount := 0
-	errorCount := 0
-	deletedCount := 0
-
-	//Get OneDrive files
-	fmt.Println("Getting list of files in folder...")
-	files, err := t.ListFolder(odpath)
-	if err != nil {
+// Does not redownload existing (up-to-date) files.
+func (t *GraphToken) SyncFolder(remotePath string, localPath string, filterFn SyncFilter, eventFn SyncEvent) error {
+	// Create local output directory
+	if err := os.MkdirAll(localPath, os.ModePerm); err != nil {
 		return err
 	}
 
-	//Load previous hashes
-	hash := make(map[string]string)
-	unseen := make(map[string]int)
-	b, err := os.ReadFile(destpath + "/" + hashfile)
-	if err == nil {
-		json.Unmarshal(b, &hash)
-		fs, _ := os.ReadDir(destpath)
-		for _, v := range fs {
-			if v.Name() != hashfile {
-				unseen[v.Name()] = 0
-			}
+	// List local directory
+	localList, err := os.ReadDir(localPath)
+	if err != nil {
+		return err
+	}
+	localFiles := make(map[string]SyncFile)
+	for _, v := range localList {
+		size := int64(0)
+		info, _ := v.Info()
+		if info != nil && !info.IsDir() {
+			size = info.Size()
 		}
-		for k := range hash {
-			unseen[k] = 0
-		}
-	} else if _, err = os.Stat(destpath); err != nil {
-
-		//Prepare destination folder
-		r := strings.SplitAfter(destpath, "/")
-		p := ""
-		for i := 0; i < len(r); i++ {
-			p += r[i]
-			if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
-				os.Mkdir(p, os.ModePerm)
-			}
+		localFiles[v.Name()] = SyncFile{
+			FileName: filepath.Join(localPath, v.Name()),
+			IsDir:    v.IsDir(),
+			Size:     size,
 		}
 	}
 
-	//Mark files for deletion
-	fmt.Println("Starting sync...")
-	download := make([]*DriveItem, 0, len(files))
+	// Initialize sync job
+	ctx := syncContext{
+		remotePath: remotePath,
+		localPath:  localPath,
+		localFiles: localFiles,
+		filterFn:   filterFn,
+		eventFn:    eventFn,
+		c:          make(chan *DriveItem, 32),
+		t:          t,
+	}
+	for i := 0; i < 5; i++ {
+		go ctx.syncQueue()
+	}
 
-	//Maybe download files
-	for _, v := range files {
-		if v.File == nil {
+	// Get OneDrive files
+	fmt.Println("Getting list of files in folder...")
+	onlineList, err := t.ListFolder(remotePath)
+	if err != nil {
+		return err
+	}
+	for _, item := range onlineList {
+		syncFile := SyncFile{
+			FileName: path.Join(remotePath, item.Name),
+			IsDir:    item.IsDir(),
+			Size:     int64(item.Size),
+		}
+		if filterFn != nil && filterFn(syncFile) {
 			continue
 		}
-		if v.File.MimeType == filetype || filetype == "" {
-			_, err := os.Stat(destpath + "/" + v.Name)
-			if h, ok := hash[v.Name]; ok && h == v.File.Hashes.QuickXor && err == nil {
 
-				//File exists is up to date
-				fmt.Println("skipped: " + v.Name)
-				skipCount++
+		// Do the thing
+		ctx.addItem(item)
+	}
+
+	// Wait for downloads to complete
+	ctx.wg.Wait()
+
+	// Remove remaining files in folder
+	for _, localFile := range localFiles {
+		if filterFn != nil && filterFn(localFile) {
+			continue
+		}
+
+		// Remove file >:)
+		err := os.Remove(localFile.FileName)
+		if eventFn != nil {
+			if err != nil {
+				eventFn(SyncMsg{
+					Action:    "error",
+					Message:   "could not delete local file",
+					LocalPath: localFile.FileName,
+				})
 			} else {
-
-				//Mark file for download
-				download = append(download, v)
+				eventFn(SyncMsg{
+					Action:    "delete",
+					Message:   "removed excess local file",
+					LocalPath: localFile.FileName,
+				})
 			}
-			delete(unseen, v.Name)
 		}
 	}
 
-	//Delete unseen files
-	for k := range unseen {
-		delete(hash, k)
-		path := destpath + "/" + k
-		if _, err := os.Stat(path); err == nil {
-			os.Remove(path)
-			fmt.Println("deleted: " + k)
-			deletedCount++
-		}
-	}
-
-	//Prepare download
-	jobs := make(chan *DriveItem, len(download))
-	results := make(chan string, len(download))
-
-	//Start downloading files
-	hashmu := &sync.Mutex{}
-	countmu := &sync.Mutex{}
-	for i := 0; i < 5; i++ {
-		go func() {
-			for i := range jobs {
-
-				//Download file
-				b, err := t.DownloadDriveItem(i)
-				if err != nil {
-					results <- "error: " + err.Error()
-					countmu.Lock()
-					errorCount++
-					countmu.Unlock()
-					continue
-				}
-
-				//Save file and all that
-				path := destpath + "/" + i.Name
-				err = os.WriteFile(path, b, os.ModePerm)
-				if err != nil {
-					results <- "error: " + err.Error()
-					countmu.Lock()
-					errorCount++
-					countmu.Unlock()
-					continue
-				}
-
-				//Write to hash file
-				hashmu.Lock()
-				hash[i.Name] = i.File.Hashes.QuickXor
-				hashmu.Unlock()
-
-				//Send result down result channel
-				results <- "downloaded: " + i.Name
-				countmu.Lock()
-				downloadCount++
-				countmu.Unlock()
-			}
-		}()
-	}
-
-	//Distribute work
-	for _, v := range download {
-		jobs <- v
-	}
-	close(jobs)
-
-	//Show results
-	for i := 0; i < len(download); i++ {
-		res := <-results
-		fmt.Println(res)
-	}
-	close(results)
-
-	//Save hash file
-	b, _ = json.MarshalIndent(hash, "", "\t")
-	os.WriteFile(destpath+"/"+hashfile, b, os.ModePerm)
-
-	//Print result of operation
-	fmt.Printf(
-		"downloaded: %d\nskipped: %d\ndeleted: %d\nerrors: %d\n",
-		downloadCount,
-		skipCount,
-		deletedCount,
-		errorCount,
-	)
+	// All good
 	return nil
 }

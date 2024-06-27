@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/sukus21/gonedrive"
 )
@@ -25,9 +28,25 @@ func main() {
 	}
 
 	//Sync files
-	err = t.SyncFolder("Musik/mp3tag", "songs", "audio/mpeg")
+	err = t.SyncFolder("Musik/mp3tag", "songs", Mp3Filter, EventHandler)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
+}
+
+func Mp3Filter(file gonedrive.SyncFile) bool {
+	if file.IsDir {
+		return true
+	}
+	return strings.ToLower(filepath.Ext(file.FileName)) != ".mp3"
+}
+
+var mux sync.Mutex
+
+func EventHandler(msg gonedrive.SyncMsg) {
+	mux.Lock()
+	defer mux.Unlock()
+
+	fmt.Println("{\n\taction:", msg.Action, "\n\tmsg:", msg.Message, "\n\tlocal:", msg.LocalPath, "\n\tremote:", msg.RemotePath, "\n}")
 }
