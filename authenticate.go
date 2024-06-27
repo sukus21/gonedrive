@@ -7,33 +7,34 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 
 	"github.com/pkg/browser"
 )
 
 const scope = "Files.ReadWrite offline_access"
 
-func CreateAccess(clientID string, redirectURI string, fname string) (*GraphToken, error) {
+// Main entrypoint for the GoneDrive package.
+// With an access token, you can do pretty much everything you want in the API.
+// The token passed in to be refreshed should be replaced after this call.
+//
+// It is recommended to store and refresh tokens, rather than generating
+// new tokens every time your program runs.
+func CreateAccess(clientID string, redirectURI string, refresh *GraphToken) (*GraphToken, error) {
 	gotToken := false
 	t := &GraphToken{
 		clientID:    clientID,
 		redirectURI: redirectURI,
 	}
 
-	//Try using old token with refresh
-	if fname != "" {
-		f, err := os.ReadFile(fname)
-		if err == nil {
-			json.Unmarshal(f, t)
-			err := t.refresh()
-			if err == nil {
-				gotToken = true
-			}
-		}
+	// Try refreshing existing token
+	if refresh != nil {
+		t = refresh
+		t.clientID = clientID
+		t.redirectURI = redirectURI
+		gotToken = t.refresh() == nil
 	}
 
-	//Get new token
+	// Get new token
 	if !gotToken {
 		err := t.generateNew()
 		if err != nil {
@@ -41,11 +42,6 @@ func CreateAccess(clientID string, redirectURI string, fname string) (*GraphToke
 		}
 	}
 
-	//Save token
-	if fname != "" {
-		b, _ := json.MarshalIndent(t, "", "\t")
-		os.WriteFile(fname, b, os.ModePerm)
-	}
 	return t, nil
 }
 
@@ -143,7 +139,7 @@ func (t *GraphToken) generateNew() error {
 
 func (t *GraphToken) refresh() error {
 	grant := "refresh_token"
-	resp, err := http.Post(
+	response, err := http.Post(
 		"https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
 		"application/x-www-form-urlencoded",
 		bytes.NewBufferString(fmt.Sprintf(
@@ -158,7 +154,8 @@ func (t *GraphToken) refresh() error {
 		return err
 	}
 
-	//Handle access token
-	body, _ := io.ReadAll(resp.Body)
-	return json.Unmarshal(body, t)
+	// Unmarshal new access token
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(response.Body)
+	return json.Unmarshal(responseBody, t)
 }
