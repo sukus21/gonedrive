@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"github.com/sukus21/gonedrive"
 )
 
+//go:embed clientid.txt
+var clientId string
+
 func main() {
 	dat, _ := os.ReadFile("graphtoken.json")
 	t := &gonedrive.GraphToken{}
@@ -18,7 +22,7 @@ func main() {
 
 	fmt.Println("Authenticating...")
 	t, err := gonedrive.CreateAccess(
-		"[app client ID goes here]",
+		clientId,
 		"http://127.0.0.1:8090/auth",
 		t,
 	)
@@ -44,9 +48,9 @@ func Mp3Filter(file gonedrive.SyncFile) bool {
 
 var mux sync.Mutex
 
-func EventHandler(msg gonedrive.SyncMsg) {
+// Prints events as they happen
+func EventHandler(msg gonedrive.SyncEvent) {
 	mux.Lock()
 	defer mux.Unlock()
-
-	fmt.Println("{\n\taction:", msg.Action, "\n\tmsg:", msg.Message, "\n\tlocal:", msg.LocalPath, "\n\tremote:", msg.RemotePath, "\n}")
+	fmt.Println(msg)
 }
