@@ -1,7 +1,7 @@
 package gonedrive
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path"
@@ -11,14 +11,8 @@ import (
 	"github.com/sukus21/gonedrive/quickxor"
 )
 
-type SyncAction string
-
-type SyncMsg struct {
-	Action     SyncAction
-	Message    string
-	LocalPath  string
-	RemotePath string
-}
+var ErrSyncLocalDirectory = errors.New("local file is directory")
+var ErrSyncRemoteDirectory = errors.New("remote file is directory")
 
 type SyncFile struct {
 	// Full file path
@@ -31,12 +25,7 @@ type SyncFile struct {
 	IsDir bool
 }
 
-type SyncFilter func(file SyncFile) bool
-type SyncEvent func(msg SyncMsg)
-
-func IgnoreFolders(file SyncFile) bool {
-	return file.IsDir
-}
+type SyncFilterFn func(file SyncFile) bool
 
 type syncContext struct {
 	t          *GraphToken
@@ -44,8 +33,8 @@ type syncContext struct {
 	wg         sync.WaitGroup
 	c          chan *DriveItem
 	localFiles map[string]SyncFile
-	filterFn   SyncFilter
-	eventFn    SyncEvent
+	filterFn   SyncFilterFn
+	eventFn    SyncEventFn
 	remotePath string
 	localPath  string
 }
@@ -57,14 +46,17 @@ func (ctx *syncContext) addItem(item *DriveItem) {
 
 func (ctx *syncContext) syncQueue() {
 	for item := range ctx.c {
-		msg := ctx.HandleItem(item)
-		if ctx.eventFn != nil {
-			ctx.eventFn(msg)
-		}
+		ctx.handleItem(item)
 	}
 }
 
-func (ctx *syncContext) HandleItem(item *DriveItem) SyncMsg {
+func (ctx *syncContext) sendEvent(event SyncEvent) {
+	if ctx.eventFn != nil {
+		ctx.eventFn(event)
+	}
+}
+
+func (ctx *syncContext) handleItem(item *DriveItem) {
 	defer ctx.wg.Done()
 
 	// Find local file in map
@@ -76,56 +68,102 @@ func (ctx *syncContext) HandleItem(item *DriveItem) SyncMsg {
 	// I'll be using these
 	remotePath := path.Join(ctx.remotePath, item.Name)
 	localPath := filepath.Join(ctx.localPath, item.Name)
-	buildMsg := func(action SyncAction, message string) SyncMsg {
-		return SyncMsg{
-			Action:     action,
-			Message:    message,
-			RemotePath: remotePath,
-			LocalPath:  localPath,
-		}
-	}
 
 	// Cannot sync directories at the moment
 	if item.IsDir() {
-		return buildMsg("error", "remote file is directory")
+		ctx.sendEvent(&SyncEventError{
+			LocalPath:  localPath,
+			RemotePath: remotePath,
+			Err:        ErrSyncRemoteDirectory,
+		})
+		return
 	}
 
 	// Handle existing local file
 	if exists {
 		// Cannot sync directories
 		if localFile.IsDir {
-			return buildMsg("error", "local file is directory")
+			ctx.sendEvent(&SyncEventError{
+				LocalPath:  localPath,
+				RemotePath: remotePath,
+				Err:        ErrSyncLocalDirectory,
+			})
+			return
 		}
 
 		// Is local file identical?
 		if ctx.syncFilesIdentical(localFile, item) {
-			return buildMsg("skip", "up to date")
+			ctx.sendEvent(&SyncEventSkip{
+				LocalPath:  localPath,
+				RemotePath: remotePath,
+			})
+			return
 		}
 
 		// No they are not, remove local file
 		if err := os.Remove(localPath); err != nil {
-			return buildMsg("error", err.Error())
+			ctx.sendEvent(&SyncEventError{
+				LocalPath:  localPath,
+				RemotePath: remotePath,
+				Err:        err,
+			})
+			return
 		}
 	}
 
-	// Download new file from remote
-	remoteReader, err := ctx.t.DownloadDriveItem(item)
-	if err != nil {
-		return buildMsg("error", err.Error())
-	}
+	// Send begin event
+	ctx.sendEvent(&SyncEventBegin{
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+	})
 
-	//Save file and all that
+	// Prepare end event
+	success := false
+	defer func() {
+		ctx.sendEvent(&SyncEventEnd{
+			LocalPath:  localPath,
+			RemotePath: remotePath,
+			IsUpload:   false,
+			Success:    success,
+		})
+	}()
+
+	// Create writer for local file
 	localWriter, err := os.Create(localPath)
 	if err != nil {
-		return buildMsg("error", err.Error())
+		ctx.sendEvent(&SyncEventError{
+			LocalPath:  localPath,
+			RemotePath: remotePath,
+			Err:        err,
+		})
+		return
 	}
 	defer localWriter.Close()
+
+	// Get reader for drive file
+	remoteReader, err := ctx.t.DownloadDriveItem(item)
+	if err != nil {
+		ctx.sendEvent(&SyncEventError{
+			LocalPath:  localPath,
+			RemotePath: remotePath,
+			Err:        err,
+		})
+		return
+	}
+	defer remoteReader.Close()
+
+	// Write remote contents to local file
 	if _, err = io.Copy(localWriter, remoteReader); err != nil {
-		return buildMsg("error", err.Error())
+		ctx.sendEvent(&SyncEventError{
+			LocalPath:  localPath,
+			RemotePath: remotePath,
+			Err:        err,
+		})
+		return
 	}
 
 	// Success!
-	return buildMsg("downloaded", "downloaded")
+	success = true
 }
 
 func (ctx *syncContext) syncFilesIdentical(local SyncFile, remote *DriveItem) bool {
@@ -149,7 +187,7 @@ func (ctx *syncContext) syncFilesIdentical(local SyncFile, remote *DriveItem) bo
 // Downloads files that don't exist in local directory.
 // Deletes files in local directory not found on OneDrive.
 // Does not redownload existing (up-to-date) files.
-func (t *GraphToken) SyncFolder(remotePath string, localPath string, filterFn SyncFilter, eventFn SyncEvent) error {
+func (t *GraphToken) SyncFolder(remotePath string, localPath string, filterFn SyncFilterFn, eventFn SyncEventFn) error {
 	// Create local output directory
 	if err := os.MkdirAll(localPath, os.ModePerm); err != nil {
 		return err
@@ -189,7 +227,6 @@ func (t *GraphToken) SyncFolder(remotePath string, localPath string, filterFn Sy
 	}
 
 	// Get OneDrive files
-	fmt.Println("Getting list of files in folder...")
 	onlineList, err := t.ListFolder(remotePath)
 	if err != nil {
 		return err
@@ -217,22 +254,17 @@ func (t *GraphToken) SyncFolder(remotePath string, localPath string, filterFn Sy
 			continue
 		}
 
-		// Remove file >:)
+		// Remove file
 		err := os.Remove(localFile.FileName)
-		if eventFn != nil {
-			if err != nil {
-				eventFn(SyncMsg{
-					Action:    "error",
-					Message:   "could not delete local file",
-					LocalPath: localFile.FileName,
-				})
-			} else {
-				eventFn(SyncMsg{
-					Action:    "delete",
-					Message:   "removed excess local file",
-					LocalPath: localFile.FileName,
-				})
-			}
+		if err != nil {
+			ctx.sendEvent(&SyncEventError{
+				LocalPath: localFile.FileName,
+				Err:       err,
+			})
+		} else {
+			ctx.sendEvent(SyncEventDelete{
+				LocalPath: localFile.FileName,
+			})
 		}
 	}
 
