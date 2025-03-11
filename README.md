@@ -1,3 +1,6 @@
+# This package is abandoned
+Use github.com/rclone/rclone instead
+
 # gonedrive
  Small OneDrive library for Go
  
